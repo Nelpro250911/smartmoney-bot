@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: smartmoney-bot
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python smartmoney_full.py"
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHAT_ID
+        sync: false
+      - key: COVALENT_KEY
+        sync: false
+      - key: REDIS_URL
+        fromService:
+          name: smartmoney-redis
+          type: redis
+      - key: TOP_WALLETS_COUNT
+        value: "30"
+      - key: POLL_SECONDS
+        value: "60"
+      - key: MIN_TRADE_USD
+        value: "1000"
+      - key: MIN_LIQ_USD
+        value: "500000"
+      - key: STRONG_SIGNAL_COWhales
+        value: "2"
+
+  - type: redis
+    name: smartmoney-redis
+    plan: free
