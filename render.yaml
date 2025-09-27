@@ -16,6 +16,7 @@ services:
         fromService:
           name: smartmoney-redis
           type: redis
+          property: connectionString
       - key: TOP_WALLETS_COUNT
         value: "30"
       - key: POLL_SECONDS
@@ -30,3 +31,7 @@ services:
   - type: redis
     name: smartmoney-redis
     plan: free
+    # ДЛЯ MVP: відкрити доступ усім вихідним IP (можеш звузити пізніше)
+    ipAllowList:
+      - source: 0.0.0.0/0
+        description: allow all
