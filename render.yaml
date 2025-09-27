@@ -1,5 +1,5 @@
 services:
-  - type: web
+  - type: worker
     name: smartmoney-bot
     env: python
     plan: free
