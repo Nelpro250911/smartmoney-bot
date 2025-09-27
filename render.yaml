@@ -1,10 +1,10 @@
 services:
-  - type: worker
+  - type: web
     name: smartmoney-bot
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python smartmoney_full.py"
+    startCommand: "bash -c 'python smartmoney_full.py & python -m http.server $PORT'"
     envVars:
       - key: BOT_TOKEN
         sync: false
@@ -31,7 +31,6 @@ services:
   - type: redis
     name: smartmoney-redis
     plan: free
-    # ДЛЯ MVP: відкрити доступ усім вихідним IP (можеш звузити пізніше)
     ipAllowList:
       - source: 0.0.0.0/0
         description: allow all
