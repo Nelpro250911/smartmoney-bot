@@ -41,7 +41,8 @@ if not BOT_TOKEN or not COVALENT_KEY or not CHAT_ID:
     raise SystemExit("❌ Set BOT_TOKEN, COVALENT_KEY, CHAT_ID in environment")
 
 # Globals
-bot = Bot(BOT_TOKEN, parse_mode="HTML")
+from aiogram.client.default import DefaultBotProperties
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 rds: redis.Redis = redis.from_url(REDIS_URL, decode_responses=True)
 scheduler = AsyncIOScheduler()
