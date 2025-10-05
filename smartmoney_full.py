@@ -220,4 +220,159 @@ async def is_seen(addr:str, tx_hash:str) -> bool:
 async def bump_token_whale(token:str, wallet:str):
     now = int(time.time())
     await rds.zadd(k_token_whales(token), {wallet: now})
-    await rds.zremrangebyscore(k_token_whales(token), 0, now - 3*24*36
+    await rds.zremrangebyscore(k_token_whales(token), 0, now - 3*24*3600)
+
+async def count_token_whales_24h(token:str) -> int:
+    now = int(time.time())
+    vals = await rds.zrangebyscore(k_token_whales(token), now-24*3600, now, withscores=False)
+    return len(set(vals))
+
+# =========================
+# Message formatting
+# =========================
+def format_signal(sig: TradeSignal) -> str:
+    _, stars = calc_score(
+        sig.roi, sig.winrate, sig.volume_usd,
+        sig.liquidity_usd, sig.whales_count_24h, sig.token_age_days
+    )
+    star_str = "⭐" * stars
+    scan_tx = EXPLORERS.get(sig.chain_id, "") + sig.tx_hash if EXPLORERS.get(sig.chain_id) else sig.tx_hash
+    token_scan = ""
+    if sig.chain_id in (1,56,137,42161,10,8453):
+        host = EXPLORERS[sig.chain_id].replace("/tx/","")
+        token_scan = f"{host}/token/{sig.token}"
+    primary_link = sig.link or scan_tx
+    ds_search = f"https://dexscreener.com/search?q={sig.token}"
+    parts = [
+        f"{star_str} Whale Signal",
+        f"<b>Кошелек:</b> {sig.wallet}",
+        f"<b>Дія:</b> {sig.action}",
+        f"<b>Токен:</b> {sig.token_symbol} (<code>{sig.token}</code>)",
+        f"<b>Сума угоди:</b> ${sig.volume_usd:,.2f}",
+        f"<b>ROI (30д):</b> {sig.roi:.0f}% | <b>Winrate:</b> {sig.winrate:.0f}%",
+        f"<b>Ліквідність:</b> ${sig.liquidity_usd:,.0f}",
+        f"<b>Інші кити за 24h у токені:</b> {sig.whales_count_24h}",
+        f"<b>Вік токена:</b> {sig.token_age_days} днів",
+        f"🔗 <a href='{primary_link}'>Переглянути</a>",
+    ]
+    if token_scan:
+        parts.append(f"🧭 <a href='{token_scan}'>Token on Scan</a>")
+    parts.append(f"🔎 <a href='{ds_search}'>Search on DexScreener</a>")
+    return "\n".join(parts)
+
+# =========================
+# CORE: refresh + monitor (без DeBank)
+# =========================
+async def refresh_top_wallets_job():
+    # Тільки з SEED_WALLETS — без зовнішніх API, щоб не падати
+    if not SEED_WALLETS:
+        return
+    wl = [WalletMeta(address=a) for a in SEED_WALLETS]
+    await save_top_wallets(wl)
+    await bot.send_message(CHAT_ID, f"🔄 Оновив список китів (SEED_WALLETS): {len(wl)} адрес.")
+
+async def monitor_job():
+    try:
+        wallets = await load_top_wallets()
+        if not wallets:
+            # якщо ще нічого немає — підтягуємо із SEED_WALLETS
+            await refresh_top_wallets_job()
+            wallets = await load_top_wallets()
+        if not wallets:
+            return
+
+        async with Http() as http:
+            for w in wallets:
+                txs = await covalent_wallet_txs(http, w.address, w.chain_id, page_size=20)
+                for tx in txs[:5]:
+                    txh = tx.get("tx_hash") or ""
+                    if not txh or await is_seen(w.address, txh):
+                        continue
+
+                    buys = parse_erc20_buys(w.address, tx)
+                    for token_addr, token_symbol, approx_usd in buys:
+                        if approx_usd < MIN_TRADE_USD:
+                            continue
+                        liq, price, age_days, pair_url, chain_slug = await dexs_token_info(http, token_addr)
+                        if liq < MIN_LIQ_USD:
+                            continue
+
+                        await bump_token_whale(token_addr, w.address)
+                        co_whales = await count_token_whales_24h(token_addr)
+
+                        sig = TradeSignal(
+                            wallet=w.address,
+                            action="BUY",
+                            token=token_addr,
+                            token_symbol=token_symbol or "TOKEN",
+                            volume_usd=approx_usd,
+                            roi=w.est_roi30,
+                            winrate=w.winrate,
+                            liquidity_usd=liq,
+                            whales_count_24h=co_whales,
+                            token_age_days=age_days if age_days < 10**6 else 365,
+                            tx_hash=txh,
+                            chain_id=w.chain_id,
+                            link=pair_url
+                        )
+
+                        _, stars = calc_score(sig.roi, sig.winrate, sig.volume_usd,
+                                              sig.liquidity_usd, sig.whales_count_24h, sig.token_age_days)
+                        if stars < 3:
+                            continue
+
+                        await bot.send_message(CHAT_ID, format_signal(sig), disable_web_page_preview=False)
+
+                    await mark_seen(w.address, txh)
+    except Exception as e:
+        try:
+            await bot.send_message(CHAT_ID, f"⚠️ Помилка моніторингу: {e}")
+        except:
+            pass
+
+# =========================
+# TELEGRAM
+# =========================
+@dp.message(Command("start"))
+async def start_cmd(m: Message):
+    await m.answer("👋 Привіт! Я SmartMoney Bot. Команди: /test, /refresh")
+
+@dp.message(Command("refresh"))
+async def refresh_cmd(m: Message):
+    await refresh_top_wallets_job()
+    await m.answer("✅ Оновив список китів із SEED_WALLETS.")
+
+@dp.message(Command("test"))
+async def test_cmd(m: Message):
+    # демо: USDC, щоб перевірити лінки
+    async with Http() as http:
+        token = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".lower()
+        liq, price, age_days, pair_url, _ = await dexs_token_info(http, token)
+    demo = TradeSignal(
+        wallet="0x123...abc",
+        action="BUY",
+        token=token,
+        token_symbol="USDC",
+        volume_usd=25000,
+        roi=42, winrate=70,
+        liquidity_usd=max(liq, 12_500_000),
+        whales_count_24h=3,
+        token_age_days=max(age_days, 365),
+        tx_hash="0xabc123",
+        chain_id=1,
+        link=pair_url
+    )
+    await m.answer(format_signal(demo), disable_web_page_preview=False)
+
+# =========================
+# MAIN
+# =========================
+async def main():
+    scheduler.add_job(monitor_job, "interval", seconds=POLL_SECONDS, id="monitor")
+    scheduler.add_job(refresh_top_wallets_job, "cron", hour=6, minute=0, id="refresh_daily")
+    scheduler.start()
+    await bot.send_message(CHAT_ID, "✅ SmartMoney запущено. Починаю моніторинг.")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
