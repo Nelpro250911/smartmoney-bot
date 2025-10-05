@@ -34,3 +34,4 @@ services:
     ipAllowList:
       - source: 0.0.0.0/0
         description: allow all
+
