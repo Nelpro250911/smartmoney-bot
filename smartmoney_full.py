@@ -1,4 +1,5 @@
-import os, asyncio, time
+# smartmoney_full.py
+import os, asyncio, time, csv, io, json
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -18,12 +19,16 @@ load_dotenv()
 
 BOT_TOKEN       = os.getenv("BOT_TOKEN")
 CHAT_ID         = int(os.getenv("CHAT_ID", "0") or "0")
-COVALENT_KEY    = os.getenv("COVALENT_KEY", "").strip()  # опціонально, але для моніторингу бажано
+COVALENT_KEY    = os.getenv("COVALENT_KEY", "").strip()
 REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
-# Кома-сепарований список гаманців (fallback замість DeBank)
-# приклад: SEED_WALLETS=0xabc...,0xdef...,0x123...
-SEED_WALLETS    = [w.strip().lower() for w in os.getenv("SEED_WALLETS", "").split(",") if w.strip()]
+# Джерела гаманців
+SEED_WALLETS          = [w.strip().lower() for w in os.getenv("SEED_WALLETS", "").split(",") if w.strip()]
+SEED_WALLETS_URL      = os.getenv("SEED_WALLETS_URL", "").strip()       # JSON-масив або {"wallets":[...]}
+SEED_WALLETS_CSV_URL  = os.getenv("SEED_WALLETS_CSV_URL", "").strip()   # CSV (Google Sheets publish), колонка "address"
+
+# DeBank Pro (опційно)
+DEBANK_ACCESS_KEY     = os.getenv("DEBANK_ACCESS_KEY", "").strip()
 
 TOP_WALLETS_COUNT   = int(os.getenv("TOP_WALLETS_COUNT", "30"))
 POLL_SECONDS        = int(os.getenv("POLL_SECONDS", "60"))
@@ -75,7 +80,8 @@ class TradeSignal:
     token_age_days: int
     tx_hash: str
     chain_id: int
-    link: str  # DexScreener pair url якщо є
+    link: str
+    wallet_usd: float = 0.0  # якщо є DeBank — підставимо total balance
 
 # =========================
 # REDIS KEYS
@@ -128,8 +134,20 @@ class Http:
                 return {}
             ct = r.headers.get("Content-Type","")
             if "application/json" not in ct:
+                try:
+                    txt = await r.text()
+                    if txt and (txt.strip().startswith("{") or txt.strip().startswith("[")):
+                        return json.loads(txt)
+                except:
+                    pass
                 return {}
             return await r.json()
+
+    async def get_text(self, url:str) -> str:
+        async with self.session.get(url) as r:
+            if r.status != 200:
+                return ""
+            return await r.text()
 
 # =========================
 # Covalent: останні транзакції
@@ -179,6 +197,39 @@ async def dexs_token_info(http: Http, token: str) -> tuple[float, float, int, st
     pair_url  = best.get("url") or ""
     chain_slug = (best.get("chainId") or "").lower()
     return liq, price, age_days, pair_url, chain_slug
+
+# =========================
+# DeBank Pro (enrichment, optional)
+# =========================
+async def debank_check_units() -> Optional[dict]:
+    if not DEBANK_ACCESS_KEY:
+        return None
+    headers = {"AccessKey": DEBANK_ACCESS_KEY}
+    async with Http(headers=headers) as http:
+        return await http.get_json("https://pro-openapi.debank.com/v1/account/units")
+
+async def debank_user_total_balance(addr: str) -> Optional[dict]:
+    if not DEBANK_ACCESS_KEY:
+        return None
+    headers = {"AccessKey": DEBANK_ACCESS_KEY}
+    async with Http(headers=headers) as http:
+        return await http.get_json(
+            "https://pro-openapi.debank.com/v1/user/total_balance",
+            params={"id": addr}
+        )
+
+async def debank_user_used_chains(addr: str) -> List[str]:
+    if not DEBANK_ACCESS_KEY:
+        return []
+    headers = {"AccessKey": DEBANK_ACCESS_KEY}
+    async with Http(headers=headers) as http:
+        js = await http.get_json(
+            "https://pro-openapi.debank.com/v1/user/used_chain_list",
+            params={"id": addr}
+        )
+        if isinstance(js, list):
+            return [str(x) for x in js]
+        return []
 
 # =========================
 # Redis helpers
@@ -243,6 +294,7 @@ def format_signal(sig: TradeSignal) -> str:
         token_scan = f"{host}/token/{sig.token}"
     primary_link = sig.link or scan_tx
     ds_search = f"https://dexscreener.com/search?q={sig.token}"
+
     parts = [
         f"{star_str} Whale Signal",
         f"<b>Кошелек:</b> {sig.wallet}",
@@ -255,27 +307,66 @@ def format_signal(sig: TradeSignal) -> str:
         f"<b>Вік токена:</b> {sig.token_age_days} днів",
         f"🔗 <a href='{primary_link}'>Переглянути</a>",
     ]
+    if sig.wallet_usd and sig.wallet_usd > 0:
+        parts.insert(1, f"<b>Баланс гаманця:</b> ${sig.wallet_usd:,.0f}")
     if token_scan:
         parts.append(f"🧭 <a href='{token_scan}'>Token on Scan</a>")
     parts.append(f"🔎 <a href='{ds_search}'>Search on DexScreener</a>")
     return "\n".join(parts)
 
 # =========================
-# CORE: refresh + monitor (без DeBank)
+# Wallet ingestion (ENV/JSON/CSV)
+# =========================
+async def ingest_wallets() -> List[str]:
+    addrs: List[str] = []
+    addrs += SEED_WALLETS
+
+    async with Http() as http:
+        if SEED_WALLETS_URL:
+            try:
+                js = await http.get_json(SEED_WALLETS_URL)
+                if isinstance(js, list):
+                    addrs += [str(x).strip().lower() for x in js if str(x).strip()]
+                elif isinstance(js, dict):
+                    lst = js.get("wallets") or []
+                    addrs += [str(x).strip().lower() for x in lst if str(x).strip()]
+            except Exception:
+                pass
+
+        if SEED_WALLETS_CSV_URL:
+            try:
+                txt = await http.get_text(SEED_WALLETS_CSV_URL)
+                if txt:
+                    reader = csv.DictReader(io.StringIO(txt))
+                    for row in reader:
+                        a = (row.get("address") or "").strip().lower()
+                        if a:
+                            addrs.append(a)
+            except Exception:
+                pass
+
+    uniq, seen = [], set()
+    for a in addrs:
+        if a and a not in seen:
+            seen.add(a)
+            uniq.append(a)
+    return uniq
+
+# =========================
+# CORE: refresh + monitor
 # =========================
 async def refresh_top_wallets_job():
-    # Тільки з SEED_WALLETS — без зовнішніх API, щоб не падати
-    if not SEED_WALLETS:
+    wallets_loaded = await ingest_wallets()
+    if not wallets_loaded:
         return
-    wl = [WalletMeta(address=a) for a in SEED_WALLETS]
+    wl = [WalletMeta(address=a) for a in wallets_loaded]
     await save_top_wallets(wl)
-    await bot.send_message(CHAT_ID, f"🔄 Оновив список китів (SEED_WALLETS): {len(wl)} адрес.")
+    await bot.send_message(CHAT_ID, f"🔄 Оновив список китів (ingest): {len(wl)} адрес.")
 
 async def monitor_job():
     try:
         wallets = await load_top_wallets()
         if not wallets:
-            # якщо ще нічого немає — підтягуємо із SEED_WALLETS
             await refresh_top_wallets_job()
             wallets = await load_top_wallets()
         if not wallets:
@@ -316,6 +407,15 @@ async def monitor_job():
                             link=pair_url
                         )
 
+                        # enrichment DeBank (опційно)
+                        if DEBANK_ACCESS_KEY:
+                            try:
+                                tb = await debank_user_total_balance(w.address)
+                                if tb and isinstance(tb, dict):
+                                    sig.wallet_usd = float(tb.get("total_usd_value") or tb.get("usd_value") or 0.0)
+                            except Exception:
+                                pass
+
                         _, stars = calc_score(sig.roi, sig.winrate, sig.volume_usd,
                                               sig.liquidity_usd, sig.whales_count_24h, sig.token_age_days)
                         if stars < 3:
@@ -335,18 +435,27 @@ async def monitor_job():
 # =========================
 @dp.message(Command("start"))
 async def start_cmd(m: Message):
-    await m.answer("👋 Привіт! Я SmartMoney Bot. Команди: /test, /refresh")
+    await m.answer("👋 Привіт! Я SmartMoney Bot. Команди: /test, /refresh, /seed, /debank")
 
 @dp.message(Command("refresh"))
 async def refresh_cmd(m: Message):
     await refresh_top_wallets_job()
-    await m.answer("✅ Оновив список китів із SEED_WALLETS.")
+    await m.answer("✅ Оновив список китів із ingest-джерел.")
+
+@dp.message(Command("seed"))
+async def seed_cmd(m: Message):
+    wallets = await load_top_wallets()
+    if not wallets:
+        await m.answer("Поки що порожньо. Використай /refresh.")
+        return
+    preview = "\n".join(f"• {w.address[:6]}…{w.address[-4:]}" for w in wallets[:30])
+    more = "" if len(wallets) <= 30 else f"\n… та ще {len(wallets)-30}"
+    await m.answer(f"<b>Завантажені гаманці ({len(wallets)}):</b>\n{preview}{more}")
 
 @dp.message(Command("test"))
 async def test_cmd(m: Message):
-    # демо: USDC, щоб перевірити лінки
     async with Http() as http:
-        token = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".lower()
+        token = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".lower()  # USDC
         liq, price, age_days, pair_url, _ = await dexs_token_info(http, token)
     demo = TradeSignal(
         wallet="0x123...abc",
@@ -363,6 +472,25 @@ async def test_cmd(m: Message):
         link=pair_url
     )
     await m.answer(format_signal(demo), disable_web_page_preview=False)
+
+@dp.message(Command("debank"))
+async def debank_cmd(m: Message):
+    if not DEBANK_ACCESS_KEY:
+        await m.answer("❌ DEBANK_ACCESS_KEY не задано.")
+        return
+    units = await debank_check_units()
+    txt = "✅ DeBank ключ активний.\n"
+    if units:
+        bal = units.get("balance", "—")
+        txt += f"Units balance: {bal}\n"
+    wallets = await load_top_wallets()
+    if wallets:
+        addr = wallets[0].address
+        tb = await debank_user_total_balance(addr)
+        if tb:
+            val = float(tb.get("total_usd_value") or tb.get("usd_value") or 0.0)
+            txt += f"Баланс {addr[:6]}…{addr[-4:]} ≈ ${val:,.0f}\n"
+    await m.answer(txt)
 
 # =========================
 # MAIN
