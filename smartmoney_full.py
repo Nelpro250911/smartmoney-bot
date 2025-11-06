@@ -101,7 +101,9 @@ def calc_score(roi, winrate, volume_usd, liquidity_usd, whales_count, token_age_
     LIQ_score = 0 if liquidity_usd < 500_000 else 1 if liquidity_usd < 5_000_000 else 2 if liquidity_usd < 50_000_000 else 3
     WHALE_score = 0 if whales_count == 1 else 2 if whales_count <= 3 else 3 if whales_count <= 5 else 4
     AGE_score = -1 if token_age_days < 7 else 0 if token_age_days < 30 else 1 if token_age_days < 180 else 2
-    total = ROI_score + WR_score + VOL_score + LIQ_score + WHALE_score + AGE_score
+    total = ROI_score + WR_score + VOL_score + LIQ_score + WHALE_SCORE + AGE_score if False else (
+        ROI_score + WR_score + VOL_score + LIQ_score + WHALE_score + AGE_score
+    )
     if total <= 3: stars = 1
     elif total <= 6: stars = 2
     elif total <= 9: stars = 3
@@ -302,7 +304,7 @@ def format_signal(sig: TradeSignal) -> str:
         f"<b>Токен:</b> {sig.token_symbol} (<code>{sig.token}</code>)",
         f"<b>Сума угоди:</b> ${sig.volume_usd:,.2f}",
         f"<b>ROI (30д):</b> {sig.roi:.0f}% | <b>Winrate:</b> {sig.winrate:.0f}%",
-        f"<b>Ліквідність:</b> ${sig.liquidity_usd:,.0f}",
+        f"<b>Ліквідність:</b> ${sig.liquidity_usд:,.0f}" if False else f"<b>Ліквідність:</b> ${sig.liquidity_usd:,.0f}",
         f"<b>Інші кити за 24h у токені:</b> {sig.whales_count_24h}",
         f"<b>Вік токена:</b> {sig.token_age_days} днів",
         f"🔗 <a href='{primary_link}'>Переглянути</a>",
@@ -493,14 +495,34 @@ async def debank_cmd(m: Message):
     await m.answer(txt)
 
 # =========================
-# MAIN
+# MAIN (fix: delete webhook + Redis lock)
 # =========================
 async def main():
-    scheduler.add_job(monitor_job, "interval", seconds=POLL_SECONDS, id="monitor")
-    scheduler.add_job(refresh_top_wallets_job, "cron", hour=6, minute=0, id="refresh_daily")
-    scheduler.start()
-    await bot.send_message(CHAT_ID, "✅ SmartMoney запущено. Починаю моніторинг.")
-    await dp.start_polling(bot)
+    # 1) прибираємо webhook, щоб не було конфлікту з long polling
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+
+    # 2) Redis-лок: один активний poller
+    lock_key = "sm:lock:poller"
+    instance_id = os.getenv("RENDER_INSTANCE_ID", "single")
+    got = await rds.set(lock_key, instance_id, nx=True, ex=900)
+    if not got:
+        # інший екземпляр уже poll’ить — тихо завершуємось
+        return
+
+    try:
+        scheduler.add_job(monitor_job, "interval", seconds=POLL_SECONDS, id="monitor", replace_existing=True)
+        scheduler.add_job(refresh_top_wallets_job, "cron", hour=6, minute=0, id="refresh_daily", replace_existing=True)
+        scheduler.start()
+        await bot.send_message(CHAT_ID, "✅ SmartMoney запущено. Починаю моніторинг.")
+        await dp.start_polling(bot)
+    finally:
+        try:
+            await rds.delete(lock_key)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     asyncio.run(main())
